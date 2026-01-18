@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'WinAWS - Windows EC2 Instance with VPC Infrastructure'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type
+
+  WindowsAMI:
+    Type: String
+    Description: Windows AMI ID
+
+  InstanceName:
+    Type: String
+    Description: Name tag for the instance
+
+  VolumeSize:
+    Type: Number
+    Default: 50
+    MinValue: 30
+    MaxValue: 16384
+    Description: Root volume size in GB
+
+  KeyPairName:
+    Type: String
+    Description: EC2 key pair name for password decryption
+
+  RDPSourceCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR block allowed to access RDP (3389)
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-vpc'
+        - Key: ManagedBy
+          Value: winaws
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-igw'
+        - Key: ManagedBy
+          Value: winaws
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-public-subnet'
+        - Key: ManagedBy
+          Value: winaws
+
+  # Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-public-rt'
+        - Key: ManagedBy
+          Value: winaws
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${InstanceName}-sg'
+      GroupDescription: 'Security group for Windows RDP access'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref RDPSourceCIDR
+          Description: 'RDP access'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-sg'
+        - Key: ManagedBy
+          Value: winaws
+
+  # EC2 Instance
+  WindowsInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref WindowsAMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+        - Key: ManagedBy
+          Value: winaws
+        - Key: OS
+          Value: Windows
+      UserData:
+        Fn::Base64: |
+          <powershell>
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Set timezone to UTC
+          Set-TimeZone -Id "UTC"
+
+          # Disable IE Enhanced Security
+          $AdminKey = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}"
+          $UserKey = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}"
+          Set-ItemProperty -Path $AdminKey -Name "IsInstalled" -Value 0
+          Set-ItemProperty -Path $UserKey -Name "IsInstalled" -Value 0
+
+          # Log completion
+          Write-Host "WinAWS initialization complete"
+          </powershell>
+
+  # Elastic IP
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref WindowsInstance
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-eip'
+        - Key: ManagedBy
+          Value: winaws
+
+Outputs:
+  InstanceId:
+    Description: Instance ID
+    Value: !Ref WindowsInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  PublicIP:
+    Description: Instance Public IP
+    Value: !Ref ElasticIP
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicIP'
+
+  VPCID:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref InstanceSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  InstanceName:
+    Description: Instance Name
+    Value: !Ref InstanceName
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceName'
+
+  RDPEndpoint:
+    Description: RDP connection endpoint
+    Value: !Sub '${ElasticIP}:3389'
+    Export:
+      Name: !Sub '${AWS::StackName}-RDPEndpoint'
